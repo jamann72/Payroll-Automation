@@ -456,13 +456,17 @@ def load_melds(file_obj) -> pd.DataFrame:
     for col in ["Total Labor Hours", "Check-In Hours"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    df = df[~df["Meld"].duplicated(keep="first")]
     return df.set_index("Meld")
 
 
 def meld_lookup(row: pd.Series | None, field: str, default="") -> str:
     if row is None:
         return default
-    return str(row.get(field, default) or "").strip()
+    val = row.get(field, default)
+    if isinstance(val, pd.Series):
+        val = val.iloc[0] if len(val) > 0 else default
+    return str(val if val is not None else "").strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
