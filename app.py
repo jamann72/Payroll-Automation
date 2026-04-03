@@ -466,7 +466,10 @@ def meld_lookup(row: pd.Series | None, field: str, default="") -> str:
     val = row.get(field, default)
     if isinstance(val, pd.Series):
         val = val.iloc[0] if len(val) > 0 else default
-    return str(val if val is not None else "").strip()
+    # Treat None and NaN as empty
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return str(default).strip()
+    return str(val).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -484,39 +487,60 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             primary = sh["meld_ids"][0] if sh["meld_ids"] else ""
             mrow = melds_df.loc[primary] if primary and primary in melds_df.index else None
 
-            # Resolve address: prefer Meld CSV, fall back to notes
-            address = (meld_lookup(mrow, "Address Line 1")
+            # ── Field mapping from CSV ────────────────────────────────────
+            # Fix 1: correct column name is "Address line 1" (lowercase l)
+            address = (meld_lookup(mrow, "Address line 1")
+                       or meld_lookup(mrow, "Address Line 1")
                        or meld_lookup(mrow, "Property Name")
                        or "")
-            unit     = meld_lookup(mrow, "Unit")
-            trade    = (meld_lookup(mrow, "Work Category")
-                        or meld_lookup(mrow, "Title")
-                        or meld_lookup(mrow, "Work Type")
-                        or "")
-            desc     = (meld_lookup(mrow, "Description")
-                        or meld_lookup(mrow, "Meld Description")
-                        or "")
-            status   = meld_lookup(mrow, "Meld Status")
+            # Fix 2: Unit — NaN values handled in meld_lookup
+            unit    = meld_lookup(mrow, "Unit")
 
-            nb       = sh["non_billable"]
-            flat_b   = is_flat_bill(sh["notes"])
-            actual   = sh["duration"]
-            paying   = actual                          # coordinator adjusts in Excel
+            # Fix 6: Trade — pull from "Title" first per SOP, then fallbacks
+            trade   = (meld_lookup(mrow, "Title")
+                       or meld_lookup(mrow, "Work Category")
+                       or meld_lookup(mrow, "Work Type")
+                       or "")
+
+            # Fix 4: Description from CSV goes into Notes (col J) AND Work Performed (col L)
+            desc    = (meld_lookup(mrow, "Description")
+                       or meld_lookup(mrow, "Meld Description")
+                       or "")
+            status  = meld_lookup(mrow, "Meld Status")
+
+            nb      = sh["non_billable"]
+            flat_b  = is_flat_bill(sh["notes"])
+            actual  = sh["duration"]
+            paying  = actual
             billable = calc_billable(actual, nb)
 
-            # Auto-note for column J
-            j_note = ""
+            # Build flag message for col J
+            flag_msg = ""
             if flat_b:
-                j_note = "Not billable- to be flat bill"   # exact SOP phrase §5.5
+                flag_msg = "Not billable- to be flat bill"   # exact SOP phrase §5.5
             elif nb:
-                j_note = non_billable_note(sh["notes"])
+                flag_msg = non_billable_note(sh["notes"])
             elif len(sh["meld_ids"]) > 1:
-                j_note = "Multi-meld entry: " + ", ".join(sh["meld_ids"][1:])
+                flag_msg = "Multi-meld entry: " + ", ".join(sh["meld_ids"][1:])
             elif primary and mrow is None:
-                j_note = f"⚠ Meld {primary} not found in CSV – verify"
+                flag_msg = f"⚠ Meld {primary} not found in CSV – verify"
+            elif not primary:
+                flag_msg = "⚠ No MWO – no work order number found in TSheets entry"
 
-            # Flag: non-billable entry with no explanatory note (§5.5 actionable error)
-            nb_missing_note = nb and not j_note.strip()
+            # Fix 4: col J = flag message + CSV description (both visible)
+            j_note = " | ".join(filter(None, [flag_msg, desc]))
+
+            # Flag: non-billable with no explanatory note (§5.5 actionable error)
+            nb_missing_note = nb and not flag_msg.strip()
+
+            # Fix 5: flag entries with no MWO at all
+            no_mwo = not primary
+
+            # Fix 6: flag entries with no Trade populated
+            no_trade = not trade.strip()
+
+            # Fix 3: flag entries where TSheets has no notes at all
+            no_raw_notes = not sh["notes"].strip()
 
             rows.append({
                 # SOP column mapping
@@ -529,21 +553,24 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
                 "Paying":     paying,                  # G  ← editable, starts = Actual
                 "Billable":   billable,                # H  ← SOP-computed
                 # (col I intentionally blank)
-                "Notes":      j_note,                  # J
-                "Trade":      trade,                   # K
-                "Work Performed": desc,                # L
+                "Notes":      j_note,                  # J  ← flag + CSV description
+                "Trade":      trade,                   # K  ← from CSV "Title"
+                "Work Performed": desc,                # L  ← CSV description
                 # Extra metadata (not in SOP layout, used for flags)
-                "_employee":       emp["name"],
-                "_date":           sh["date"],
-                "_date_iso":       sh["date_iso"],
-                "_time_out":       sh["time_out"],
-                "_meld_ids":       sh["meld_ids"],
-                "_non_bill":       nb,
-                "_flat_bill":      flat_b,
-                "_nb_missing_note":nb_missing_note,
-                "_meld_found":     mrow is not None,
-                "_raw_notes":      sh["notes"],
-                "_status":         status,
+                "_employee":        emp["name"],
+                "_date":            sh["date"],
+                "_date_iso":        sh["date_iso"],
+                "_time_out":        sh["time_out"],
+                "_meld_ids":        sh["meld_ids"],
+                "_non_bill":        nb,
+                "_flat_bill":       flat_b,
+                "_nb_missing_note": nb_missing_note,
+                "_meld_found":      mrow is not None,
+                "_no_mwo":          no_mwo,
+                "_no_trade":        no_trade,
+                "_no_raw_notes":    no_raw_notes,
+                "_raw_notes":       sh["notes"],
+                "_status":          status,
             })
     return rows
 
@@ -1036,6 +1063,16 @@ def main():
                          .rename(columns={"_date":"Date"}),
                          use_container_width=True, hide_index=True)
 
+        # ── Entries with no MWO (Fix 5) ───────────────────────────────────
+        no_mwo_rows = [r for r in recap_rows if r.get("_no_mwo")]
+        if no_mwo_rows:
+            st.error(f"⚠ {len(no_mwo_rows)} time entries have NO work order number (MWO) – review required")
+            st.dataframe(pd.DataFrame(no_mwo_rows)[["Tech","_date","Actual","_raw_notes"]]
+                         .rename(columns={"_date":"Date","_raw_notes":"TSheets Notes"}),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.success("✅ All time entries have a work order number.")
+
         # ── Unmatched melds ────────────────────────────────────────────────
         unmatched = [r for r in recap_rows if r["MWO"] and not r["_meld_found"]]
         if unmatched:
@@ -1045,6 +1082,26 @@ def main():
                          use_container_width=True, hide_index=True)
         else:
             st.success("✅ All Meld IDs matched to the CSV.")
+
+        # ── Missing Trade (Fix 6) ──────────────────────────────────────────
+        no_trade_rows = [r for r in recap_rows if r.get("_no_trade") and not r.get("_no_mwo")]
+        if no_trade_rows:
+            st.warning(f"⚠ {len(no_trade_rows)} entries are missing a Trade/Title – review CSV")
+            st.dataframe(pd.DataFrame(no_trade_rows)[["Tech","_date","MWO","Actual","_raw_notes"]]
+                         .rename(columns={"_date":"Date","_raw_notes":"TSheets Notes"}),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.success("✅ All matched entries have a Trade populated.")
+
+        # ── Entries with no TSheets notes (Fix 3) ─────────────────────────
+        no_notes_rows = [r for r in recap_rows if r.get("_no_raw_notes")]
+        if no_notes_rows:
+            st.warning(f"⚠ {len(no_notes_rows)} time entries have no notes in TSheets – review required")
+            st.dataframe(pd.DataFrame(no_notes_rows)[["Tech","_date","MWO","Actual"]]
+                         .rename(columns={"_date":"Date"}),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.success("✅ All time entries have TSheets notes.")
 
         # ── Non-billable summary ───────────────────────────────────────────
         nb_rows = [r for r in recap_rows if r["_non_bill"]]
