@@ -439,25 +439,31 @@ def _date_iso(s: str) -> str:
 
 def load_melds(file_obj) -> pd.DataFrame:
     """
-    Accepts either:
-      • melds_report CSV  (Meld Number, Property Name, Unit, Work Category, …)
-      • Work Log Summary  (Meld, Agent, Unit, Title, Description, Check-In Hours, Address Line 1)
-    Returns DataFrame indexed by uppercase Meld Number.
+    SOP §4.1 (Updated): Property Meld Work Log Summary is the PRIMARY source.
+    Returns ALL rows (one per work log check-in entry) as a flat DataFrame.
+    Columns expected: Agent, Meld, Unit, Title, Description, Check In, Hours, Address line 1
     """
     df = pd.read_csv(file_obj, dtype=str)
     df.columns = df.columns.str.strip()
-    # Normalise Meld Number column (two possible names)
     if "Meld Number" in df.columns:
         df = df.rename(columns={"Meld Number": "Meld"})
     if "Meld" not in df.columns:
         raise ValueError("CSV must contain a 'Meld' or 'Meld Number' column.")
     df["Meld"] = df["Meld"].str.strip().str.upper()
-    # Numeric hours
-    for col in ["Total Labor Hours", "Check-In Hours"]:
+    # Parse numeric hours columns
+    for col in ["Hours", "Total Labor Hours", "Check-In Hours"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    df = df[~df["Meld"].duplicated(keep="first")]
-    return df.set_index("Meld")
+    # Keep ALL rows — do NOT deduplicate (each check-in is a separate billing row)
+    return df.reset_index(drop=True)
+
+
+def _clean(val) -> str:
+    """Convert any value to string, treating NaN/None as empty."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ("nan", "none") else s
 
 
 def meld_lookup(row: pd.Series | None, field: str, default="") -> str:
@@ -466,7 +472,6 @@ def meld_lookup(row: pd.Series | None, field: str, default="") -> str:
     val = row.get(field, default)
     if isinstance(val, pd.Series):
         val = val.iloc[0] if len(val) > 0 else default
-    # Treat None and NaN as empty
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return str(default).strip()
     return str(val).strip()
@@ -478,100 +483,128 @@ def meld_lookup(row: pd.Series | None, field: str, default="") -> str:
 
 def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict]:
     """
-    Build one dict per TSheets shift entry (SOP §5.4–5.5).
-    Columns match the SOP's Weekly Recap (Planet Synergy PM Report) layout.
+    SOP §4.1 UPDATED: Property Meld CSV is the FOUNDATION.
+    One output row per CSV work log entry.
+    TSheets used ONLY for Actual / Paying / Billable hours (Cols F / G / H).
+
+    Matching: (agent_name_lower, meld_id, date) → TSheets shift
     """
-    rows = []
+    # ── Build TSheets lookup ──────────────────────────────────────────────────
+    # Primary key: (name_lower, meld_upper, date_iso)
+    # Fallback:    (name_lower, meld_upper) → list of shifts
+    ts_exact: dict[tuple, dict] = {}
+    ts_by_meld: dict[tuple, list] = {}
     for emp in employees:
+        name_l = emp["name"].strip().lower()
         for sh in emp["shifts"]:
-            primary = sh["meld_ids"][0] if sh["meld_ids"] else ""
-            mrow = melds_df.loc[primary] if primary and primary in melds_df.index else None
+            for mid in sh["meld_ids"]:
+                mid_u = mid.upper()
+                ts_exact[(name_l, mid_u, sh["date_iso"])] = sh
+                ts_by_meld.setdefault((name_l, mid_u), []).append(sh)
 
-            # ── Field mapping from CSV ────────────────────────────────────
-            # Fix 1: correct column name is "Address line 1" (lowercase l)
-            address = (meld_lookup(mrow, "Address line 1")
-                       or meld_lookup(mrow, "Address Line 1")
-                       or meld_lookup(mrow, "Property Name")
-                       or "")
-            # Fix 2: Unit — NaN values handled in meld_lookup
-            unit    = meld_lookup(mrow, "Unit")
+    rows = []
+    for _, csv_row in melds_df.iterrows():
+        meld    = _clean(csv_row.get("Meld", "")).upper()
+        agent   = _clean(csv_row.get("Agent", ""))
+        agent_l = agent.lower()
 
-            # Fix 6: Trade — pull from "Title" first per SOP, then fallbacks
-            trade   = (meld_lookup(mrow, "Title")
-                       or meld_lookup(mrow, "Work Category")
-                       or meld_lookup(mrow, "Work Type")
-                       or "")
+        # ── Parse Check-In date/time from CSV ─────────────────────────────
+        checkin_raw = _clean(csv_row.get("Check In", ""))
+        date_iso, date_display, time_in_display = "", "", ""
+        if checkin_raw:
+            try:
+                dt = pd.to_datetime(checkin_raw)
+                date_iso        = dt.strftime("%Y-%m-%d")
+                date_display    = f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+                hour            = dt.strftime("%I").lstrip("0") or "12"
+                time_in_display = f"{hour}:{dt.strftime('%M%p').lower()}"
+            except Exception:
+                date_display = checkin_raw
 
-            # Fix 4: Description from CSV goes into Notes (col J) AND Work Performed (col L)
-            desc    = (meld_lookup(mrow, "Description")
-                       or meld_lookup(mrow, "Meld Description")
-                       or "")
-            status  = meld_lookup(mrow, "Meld Status")
+        # ── Find matching TSheets shift ────────────────────────────────────
+        tshift = ts_exact.get((agent_l, meld, date_iso))
+        if not tshift:
+            candidates = ts_by_meld.get((agent_l, meld), [])
+            # Pick candidate whose date matches; if none, take first
+            tshift = next((c for c in candidates if c["date_iso"] == date_iso), None)
+            if not tshift and candidates:
+                tshift = candidates[0]
 
-            nb      = sh["non_billable"]
-            flat_b  = is_flat_bill(sh["notes"])
-            actual  = sh["duration"]
-            paying  = actual
-            billable = calc_billable(actual, nb)
+        # ── Hours: TSheets if matched, else CSV Hours column ───────────────
+        if tshift:
+            actual    = tshift["duration"]
+            time_in   = tshift["time_in"] or time_in_display
+            raw_notes = tshift["notes"]
+            nb        = tshift["non_billable"]
+            flat_b    = is_flat_bill(tshift["notes"])
+            ts_ok     = True
+        else:
+            csv_hrs = csv_row.get("Hours") or csv_row.get("Check-In Hours") or 0
+            try:
+                actual = float(csv_hrs)
+            except (ValueError, TypeError):
+                actual = 0.0
+            time_in   = time_in_display
+            raw_notes = ""
+            nb        = False
+            flat_b    = False
+            ts_ok     = False
 
-            # Build flag message for col J
-            flag_msg = ""
-            if flat_b:
-                flag_msg = "Not billable- to be flat bill"   # exact SOP phrase §5.5
-            elif nb:
-                flag_msg = non_billable_note(sh["notes"])
-            elif len(sh["meld_ids"]) > 1:
-                flag_msg = "Multi-meld entry: " + ", ".join(sh["meld_ids"][1:])
-            elif primary and mrow is None:
-                flag_msg = f"⚠ Meld {primary} not found in CSV – verify"
-            elif not primary:
-                flag_msg = "⚠ No MWO – no work order number found in TSheets entry"
+        paying   = actual
+        billable = calc_billable(actual, nb)
 
-            # Fix 4: col J = flag message + CSV description (both visible)
-            j_note = " | ".join(filter(None, [flag_msg, desc]))
+        # ── CSV fields (§5.4) ─────────────────────────────────────────────
+        address = (_clean(csv_row.get("Address line 1"))
+                   or _clean(csv_row.get("Address Line 1"))
+                   or _clean(csv_row.get("Property Name")))
+        unit    = _clean(csv_row.get("Unit"))
+        trade   = (_clean(csv_row.get("Title"))
+                   or _clean(csv_row.get("Work Category"))
+                   or _clean(csv_row.get("Work Type")))
+        desc    = (_clean(csv_row.get("Description"))
+                   or _clean(csv_row.get("Meld Description")))
+        status  = _clean(csv_row.get("Meld Status"))
 
-            # Flag: non-billable with no explanatory note (§5.5 actionable error)
-            nb_missing_note = nb and not flag_msg.strip()
+        # ── Notes column J: flags + description ───────────────────────────
+        flag_parts = []
+        if flat_b:
+            flag_parts.append("Not billable- to be flat bill")
+        elif nb:
+            flag_parts.append(non_billable_note(raw_notes))
+        if not ts_ok:
+            flag_parts.append("⚠ No TSheets match – hours from CSV")
+        j_note = " | ".join(filter(None, flag_parts + [desc]))
 
-            # Fix 5: flag entries with no MWO at all
-            no_mwo = not primary
+        rows.append({
+            "MWO":            meld,            # A – from CSV Meld
+            "Tech":           agent,           # B – from CSV Agent
+            "Address":        address,         # C – from CSV Address line 1
+            "Unit":           unit,            # D – from CSV Unit
+            "Check-In":       time_in,         # E – from TSheets (or CSV)
+            "Actual":         actual,          # F – from TSheets only
+            "Paying":         paying,          # G – starts = Actual, coordinator adjusts
+            "Billable":       billable,        # H – SOP-computed
+            "Notes":          j_note,          # J – flags + CSV Description
+            "Trade":          trade,           # K – from CSV Title
+            "Work Performed": desc,            # L – from CSV Description
+            # ── Metadata for flags/display ──────────────────────────────
+            "_employee":         agent,
+            "_date":             date_display,
+            "_date_iso":         date_iso,
+            "_time_out":         tshift["time_out"] if tshift else "",
+            "_meld_ids":         [meld] if meld else [],
+            "_non_bill":         nb,
+            "_flat_bill":        flat_b,
+            "_nb_missing_note":  nb and not flag_parts,
+            "_meld_found":       True,          # all rows come from CSV
+            "_tsheets_matched":  ts_ok,
+            "_no_mwo":           not meld,
+            "_no_trade":         not trade,
+            "_no_raw_notes":     not raw_notes.strip(),
+            "_raw_notes":        raw_notes,
+            "_status":           status,
+        })
 
-            # Fix 6: flag entries with no Trade populated
-            no_trade = not trade.strip()
-
-            # Fix 3: flag entries where TSheets has no notes at all
-            no_raw_notes = not sh["notes"].strip()
-
-            rows.append({
-                # SOP column mapping
-                "MWO":        primary,                 # A
-                "Tech":       emp["name"],             # B
-                "Address":    address,                 # C
-                "Unit":       unit,                    # D
-                "Check-In":   sh["time_in"],           # E
-                "Actual":     actual,                  # F  ← from TSheets
-                "Paying":     paying,                  # G  ← editable, starts = Actual
-                "Billable":   billable,                # H  ← SOP-computed
-                # (col I intentionally blank)
-                "Notes":      j_note,                  # J  ← flag + CSV description
-                "Trade":      trade,                   # K  ← from CSV "Title"
-                "Work Performed": desc,                # L  ← CSV description
-                # Extra metadata (not in SOP layout, used for flags)
-                "_employee":        emp["name"],
-                "_date":            sh["date"],
-                "_date_iso":        sh["date_iso"],
-                "_time_out":        sh["time_out"],
-                "_meld_ids":        sh["meld_ids"],
-                "_non_bill":        nb,
-                "_flat_bill":       flat_b,
-                "_nb_missing_note": nb_missing_note,
-                "_meld_found":      mrow is not None,
-                "_no_mwo":          no_mwo,
-                "_no_trade":        no_trade,
-                "_no_raw_notes":    no_raw_notes,
-                "_raw_notes":       sh["notes"],
-                "_status":          status,
-            })
     return rows
 
 
@@ -698,13 +731,14 @@ def _sheet_weekly_recap(wb: Workbook, rows: list[dict], employees: list[dict]):
 
             # SOP flag overrides (priority order: red > orange > yellow > purple)
             paying_gt_billable  = r["Paying"] > r["Billable"] and r["Billable"] > 0
-            meld_missing        = r["MWO"] and not r["_meld_found"]
+            ts_missing          = not r.get("_tsheets_matched", True)
             nb_no_note          = r.get("_nb_missing_note", False)
             flat_bill           = r.get("_flat_bill", False)
 
-            if meld_missing:
+            if ts_missing:
                 row_fill = RED_FILL
-                flags.append({"type": "Missing Meld", "employee": emp_name,
+                flags.append({"type": "No TSheets Match – hours from CSV",
+                              "employee": emp_name,
                               "meld": r["MWO"], "date": r["_date"],
                               "hours": r["Actual"]})
             elif nb_no_note:
@@ -797,7 +831,7 @@ def _sheet_weekly_recap(wb: Workbook, rows: list[dict], employees: list[dict]):
     leg_row = gt_row + 2
     ws.cell(row=leg_row, column=1, value="Legend:").font = BOLD_FONT
     items = [
-        (RED_FILL,    "Meld ID not found in CSV – verify entry (§6)"),
+        (RED_FILL,    "No TSheets match – hours taken from CSV fallback (§4.1)"),
         (ORANGE_FILL, "Non-billable entry missing explanation – actionable error (§5.5)"),
         (YELLOW_FILL, "Paying > Billable – manager review required (§6)"),
         (PURPLE_FILL, "Flat-bill entry – 'Not billable- to be flat bill' (§5.5)"),
@@ -906,23 +940,29 @@ def main():
         st.info("Upload both files above to generate the payroll report.")
         with st.expander("SOP Summary (Updated 3-26-2026)"):
             st.markdown("""
+**§4.1 Data Source Hierarchy (CRITICAL CONTROL):**
+| Source | Role |
+|--------|------|
+| **Property Meld CSV** | PRIMARY — foundation of every row (MWO, Tech, Address, Unit, Check-In, Trade, Description) |
+| **TSheets PDF** | SECONDARY — used **only** for Cols F / G / H (Actual, Paying, Billable hours) |
+
 **Three-tier hours system (§5.5):**
 | Column | Name | Source | Rule |
 |--------|------|--------|------|
 | F | **Actual** | TSheets | Exact hours worked — must match TSheets total |
 | G | **Paying** | Coordinator | Approved payable hours — may differ from Actual if unreasonable |
-| H | **Billable** | Computed | Min 1 hr, rounded **UP** to nearest 0.25 hr; 0 for non-billable |
+| H | **Billable** | Computed | Min 1 hr, rounded to nearest 0.25 hr; 0 for non-billable |
 
-**Key SOP rules (Updated §5.5):**
-- Paying ≤ Billable (flag if violated — manager review required)
+**Key SOP rules:**
+- All work order rows come from Property Meld CSV — TSheets is time-only
 - PTO does **not** count toward overtime
 - OT = Paying hours over 40 per week
-- Non-billable → Billable = 0 + **detailed explanation REQUIRED** in Notes col J (failure if missing)
-- Flat billing requires **exact phrase**: `Not billable- to be flat bill` (no variation)
+- Non-billable → Billable = 0 + **detailed explanation REQUIRED** in Notes col J
+- Flat billing requires **exact phrase**: `Not billable- to be flat bill`
 - All adjustments (Paying ≠ Actual) require a note + manager approval
 
 **Flag colors in Excel output:**
-- 🔴 Red = Meld ID not found in CSV
+- 🔴 Red = No TSheets match found (hours from CSV fallback) — verify tech clocked in
 - 🟠 Orange = Non-billable entry missing explanation note *(actionable error)*
 - 🟡 Yellow = Paying > Billable *(manager review)*
 - 🟣 Purple = Flat-bill entry
@@ -970,14 +1010,14 @@ def main():
     total_actual   = sum(r["Actual"]   for r in recap_rows)
     total_billable = sum(r["Billable"] for r in recap_rows)
     flat_bill_hrs  = sum(r["Actual"] for r in recap_rows if r.get("_flat_bill"))
-    missing_melds  = sum(1 for r in recap_rows if r["MWO"] and not r["_meld_found"])
+    no_ts_match    = sum(1 for r in recap_rows if not r.get("_tsheets_matched", True))
     total_ot_hrs   = sum(r["Overtime"] for r in payroll_rows)
 
-    m3.metric("Total Actual Hrs",    f"{total_actual:.2f}")
-    m4.metric("Total Billable Hrs",  f"{total_billable:.2f}")
-    m5.metric("Flat Billed Hrs",     f"{flat_bill_hrs:.2f}")
-    m6.metric("⚠ Unmatched Melds",  missing_melds)
-    m7.metric("Total OT Hrs",        f"{total_ot_hrs:.2f}")
+    m3.metric("Total Actual Hrs",     f"{total_actual:.2f}")
+    m4.metric("Total Billable Hrs",   f"{total_billable:.2f}")
+    m5.metric("Flat Billed Hrs",      f"{flat_bill_hrs:.2f}")
+    m6.metric("⚠ No TSheets Match",  no_ts_match)
+    m7.metric("Total OT Hrs",         f"{total_ot_hrs:.2f}")
 
     nb_no_note_count = sum(1 for r in recap_rows if r.get("_nb_missing_note"))
     m8.metric("🚨 Missing NB Notes", nb_no_note_count)
@@ -1073,15 +1113,16 @@ def main():
         else:
             st.success("✅ All time entries have a work order number.")
 
-        # ── Unmatched melds ────────────────────────────────────────────────
-        unmatched = [r for r in recap_rows if r["MWO"] and not r["_meld_found"]]
-        if unmatched:
-            st.error(f"{len(unmatched)} shift entries reference a Meld ID not found in the CSV:")
-            st.dataframe(pd.DataFrame(unmatched)[["Tech","_date","MWO","Actual","_raw_notes"]]
-                         .rename(columns={"_date":"Date","_raw_notes":"Notes"}),
+        # ── Entries with no TSheets match (§4.1) ──────────────────────────
+        no_ts_rows = [r for r in recap_rows if not r.get("_tsheets_matched", True)]
+        if no_ts_rows:
+            st.error(f"🔴 {len(no_ts_rows)} work log entries could not be matched to a TSheets time entry – hours taken from CSV")
+            st.caption("These entries exist in Property Meld but no matching TSheets shift was found for this tech + work order + date. Verify the tech clocked in/out correctly in TSheets.")
+            st.dataframe(pd.DataFrame(no_ts_rows)[["Tech","_date","MWO","Actual","Trade","Address"]]
+                         .rename(columns={"_date":"Date"}),
                          use_container_width=True, hide_index=True)
         else:
-            st.success("✅ All Meld IDs matched to the CSV.")
+            st.success("✅ All Property Meld entries matched to a TSheets time entry.")
 
         # ── Missing Trade (Fix 6) ──────────────────────────────────────────
         no_trade_rows = [r for r in recap_rows if r.get("_no_trade") and not r.get("_no_mwo")]
