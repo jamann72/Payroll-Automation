@@ -209,6 +209,72 @@ def _find_name(lines: list[str], date_idx: int) -> str:
     return " ".join(candidate_parts) if candidate_parts else ""
 
 
+def _rejoin_split_shifts(lines: list[str]) -> list[str]:
+    """
+    pdfplumber sometimes splits a single shift row across multiple lines when
+    timezone markers like (EDT) or (EST) are present.  Possible formats:
+
+      4-line split:   "10:52am (EDT)" / "1:53pm (EDT)" / "3.02" / "Shift Total"
+      3-line split:   "10:52am (EDT) 1:53pm (EDT)" / "3.02" / "Shift Total"
+      2-line split:   "10:52am (EDT) 1:53pm (EDT) 3.02" / "Shift Total"
+
+    All are rejoined into a single line so shift_re can match them.
+    """
+    _time_only = re.compile(
+        r'^\d{1,2}:\d{2}[ap]m(?:\s*\([A-Z]{2,4}\))?$', re.I)
+    _two_times = re.compile(
+        r'^\d{1,2}:\d{2}[ap]m(?:\s*\([A-Z]{2,4}\))?\s+'
+        r'\d{1,2}:\d{2}[ap]m(?:\s*\([A-Z]{2,4}\))?$', re.I)
+    _two_times_float = re.compile(
+        r'^\d{1,2}:\d{2}[ap]m(?:\s*\([A-Z]{2,4}\))?\s+'
+        r'\d{1,2}:\d{2}[ap]m(?:\s*\([A-Z]{2,4}\))?\s+\d+\.\d+$', re.I)
+    _float_only  = re.compile(r'^\d+\.\d+$')
+
+    result = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i].strip()
+
+        # ── 4-line split: time / time / float / "Shift Total" ────────────
+        if _time_only.match(ln):
+            # collect next 3 non-blank lines
+            ahead, j = [], i + 1
+            while j < len(lines) and len(ahead) < 3:
+                pk = lines[j].strip(); j += 1
+                if pk: ahead.append(pk)
+            if (len(ahead) == 3
+                    and _time_only.match(ahead[0])
+                    and _float_only.match(ahead[1])
+                    and ahead[2] == "Shift Total"):
+                result.append(f"{ln} {ahead[0]} {ahead[1]} Shift Total")
+                i = j; continue
+
+        # ── 3-line split: "time time" / float / "Shift Total" ────────────
+        if _two_times.match(ln):
+            ahead, j = [], i + 1
+            while j < len(lines) and len(ahead) < 2:
+                pk = lines[j].strip(); j += 1
+                if pk: ahead.append(pk)
+            if (len(ahead) == 2
+                    and _float_only.match(ahead[0])
+                    and ahead[1] == "Shift Total"):
+                result.append(f"{ln} {ahead[0]} Shift Total")
+                i = j; continue
+
+        # ── 2-line split: "time time float" / "Shift Total" ─────────────
+        if _two_times_float.match(ln):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and lines[j].strip() == "Shift Total":
+                result.append(f"{ln} Shift Total")
+                i = j + 1; continue
+
+        result.append(ln)
+        i += 1
+    return result
+
+
 def parse_qb_pdf(file_obj) -> list[dict]:
     """
     Parse the TSheets Payroll PDF and return a list of employee dicts.
@@ -225,7 +291,8 @@ def parse_qb_pdf(file_obj) -> list[dict]:
 
 
 def _parse_lines(full_text: str) -> list[dict]:
-    lines = full_text.splitlines()
+    raw_lines = full_text.splitlines()
+    lines = _rejoin_split_shifts(raw_lines)   # fix (EDT)-split rows first
 
     date_range_re = re.compile(r'(\d{2}/\d{2}/\d{4})\s+to\s+(\d{2}/\d{2}/\d{4})')
     month_re = re.compile(
@@ -233,9 +300,10 @@ def _parse_lines(full_text: str) -> list[dict]:
         r'September|October|November|December)\s+\d{1,2},\s+\d{4}'
     )
     shift_re = re.compile(
-        r'^(\d{1,2}:\d{2}[ap]m(?:\s*\(EDT\))?)\s+'
-        r'(\d{1,2}:\d{2}[ap]m(?:\s*\(EDT\))?)\s+'
-        r'(\d+\.\d+)\s+Shift Total'
+        r'^(\d{1,2}:\d{2}[ap]m(?:\s*\([A-Z]{2,4}\))?)\s+'
+        r'(\d{1,2}:\d{2}[ap]m(?:\s*\([A-Z]{2,4}\))?)\s+'
+        r'(\d+\.\d+)\s+Shift Total',
+        re.IGNORECASE
     )
     single_float_re = re.compile(r'^\d+\.\d+$')
 
