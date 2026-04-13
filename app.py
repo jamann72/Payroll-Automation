@@ -512,10 +512,12 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
     ts_name_meld_date: dict[tuple, dict] = {}   # (name_norm, meld, date) → shift
     ts_name_meld:      dict[tuple, list] = {}   # (name_norm, meld)       → [shifts]
     ts_meld_only:      dict[str,   list] = {}   # meld                    → [shifts]
+    ts_name_date:      dict[tuple, list] = {}   # (name_norm, date_iso)   → [shifts]
 
     for emp in employees:
         name_n = _norm_name(emp["name"])
         for sh in emp["shifts"]:
+            ts_name_date.setdefault((name_n, sh["date_iso"]), []).append(sh)
             for mid in sh["meld_ids"]:
                 mid_u = mid.upper()
                 ts_name_meld_date[(name_n, mid_u, sh["date_iso"])] = sh
@@ -557,6 +559,27 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             tshift = next((c for c in meld_cands if c["date_iso"] == date_iso), None)
             if not tshift and meld_cands:
                 tshift = meld_cands[0]
+
+        # ── Tier 3.5: Same tech + same date + closest duration ────────────
+        # Handles cases where Meld ID is in TSheets notes but pdfplumber
+        # failed to capture it (e.g. multi-line notes, # prefix, encoding).
+        # Matches the shift whose duration is within 0.25 hrs of CSV hours.
+        if not tshift and date_iso and agent_n:
+            csv_hrs_raw = csv_row.get("Hours") or csv_row.get("Check-In Hours") or 0
+            try:
+                csv_hrs_f = float(csv_hrs_raw)
+            except (ValueError, TypeError):
+                csv_hrs_f = 0.0
+            if csv_hrs_f > 0:
+                day_shifts = ts_name_date.get((agent_n, date_iso), [])
+                best, best_diff = None, 999.0
+                for s in day_shifts:
+                    diff = abs(s["duration"] - csv_hrs_f)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best = s
+                if best and best_diff <= 0.25:
+                    tshift = best
 
         # ── Hours resolution ──────────────────────────────────────────────
         if tshift:
