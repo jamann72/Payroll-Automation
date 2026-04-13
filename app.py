@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-MELD_RE = re.compile(r'\b(T[A-Z0-9]{5,10})\b')
+MELD_RE = re.compile(r'#?(T[A-Z0-9]{5,10})(?![A-Z0-9])')
 
 # Keywords that make a shift entry non-billable (§5.5 / §5.6)
 NON_BILLABLE_KW = [
@@ -401,9 +401,17 @@ def _parse_lines(full_text: str) -> list[dict]:
             i += 1; continue
 
         if reading_notes and shift:
-            if line and not month_re.match(line) and not shift_re.match(line) \
-                    and not line.startswith("Generated"):
-                notes_buf += " " + line
+            # Stop only on structural markers — NOT on blank lines.
+            # Blank lines inside pdfplumber output can split a single long note
+            # across multiple extracted lines, causing Meld IDs at the end to
+            # be missed if we stop at the first empty line.
+            is_structural = (month_re.match(line)
+                             or shift_re.match(line)
+                             or line.startswith("Generated")
+                             or line.startswith("NOTES:"))
+            if not is_structural:
+                if line:                        # skip blank lines but don't stop
+                    notes_buf += " " + line
                 i += 1; continue
             else:
                 shift["notes"] = notes_buf.strip()
@@ -411,7 +419,7 @@ def _parse_lines(full_text: str) -> list[dict]:
                 shift["non_billable"] = is_non_billable(shift["notes"])
                 reading_notes = False
                 notes_buf = ""
-                # fall through — re-process this line
+                # fall through — re-process this structural line
 
         if line.startswith("Generated for"):
             _flush_emp()
