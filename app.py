@@ -292,7 +292,15 @@ def parse_qb_pdf(file_obj) -> list[dict]:
 
 def _parse_lines(full_text: str) -> list[dict]:
     raw_lines = full_text.splitlines()
-    lines = _rejoin_split_shifts(raw_lines)   # fix (EDT)-split rows first
+    # Strip page-footer lines ("Generated for Stonelink...") BEFORE any other
+    # processing.  pdfplumber injects these footers in the middle of an
+    # employee's section when the section spans a page boundary, which causes
+    # the parser to prematurely end the employee block and lose all remaining
+    # shifts on the next page.  Employee boundaries are reliably detected via
+    # the date-range line, so these footers are safe to remove entirely.
+    raw_lines = [l for l in raw_lines
+                 if not l.strip().startswith("Generated for Stonelink")]
+    lines = _rejoin_split_shifts(raw_lines)   # fix (EDT)-split rows next
 
     date_range_re = re.compile(r'(\d{2}/\d{2}/\d{4})\s+to\s+(\d{2}/\d{2}/\d{4})')
     month_re = re.compile(
