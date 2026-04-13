@@ -487,26 +487,38 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
     One output row per CSV work log entry.
     TSheets used ONLY for Actual / Paying / Billable hours (Cols F / G / H).
 
-    Matching: (agent_name_lower, meld_id, date) → TSheets shift
+    Four-tier matching strategy (most → least specific):
+      1. Normalized name + Meld + date
+      2. Normalized name + Meld (any date)
+      3. Meld ID only across all techs (most robust — handles name mismatches)
+      4. CSV Hours column as fallback (no flag if hours are present)
     """
-    # ── Build TSheets lookup ──────────────────────────────────────────────────
-    # Primary key: (name_lower, meld_upper, date_iso)
-    # Fallback:    (name_lower, meld_upper) → list of shifts
-    ts_exact: dict[tuple, dict] = {}
-    ts_by_meld: dict[tuple, list] = {}
+    def _norm_name(n: str) -> str:
+        """Lowercase, strip punctuation and suffixes for name comparison."""
+        n = n.lower().strip()
+        n = re.sub(r'[.\-]', ' ', n)          # J. → J, Jr. → Jr
+        n = re.sub(r'\b(jr|sr|ii|iii)\b', '', n)
+        return re.sub(r'\s+', ' ', n).strip()
+
+    # ── Build TSheets lookups ─────────────────────────────────────────────────
+    ts_name_meld_date: dict[tuple, dict] = {}   # (name_norm, meld, date) → shift
+    ts_name_meld:      dict[tuple, list] = {}   # (name_norm, meld)       → [shifts]
+    ts_meld_only:      dict[str,   list] = {}   # meld                    → [shifts]
+
     for emp in employees:
-        name_l = emp["name"].strip().lower()
+        name_n = _norm_name(emp["name"])
         for sh in emp["shifts"]:
             for mid in sh["meld_ids"]:
                 mid_u = mid.upper()
-                ts_exact[(name_l, mid_u, sh["date_iso"])] = sh
-                ts_by_meld.setdefault((name_l, mid_u), []).append(sh)
+                ts_name_meld_date[(name_n, mid_u, sh["date_iso"])] = sh
+                ts_name_meld.setdefault((name_n, mid_u), []).append(sh)
+                ts_meld_only.setdefault(mid_u, []).append(sh)
 
     rows = []
     for _, csv_row in melds_df.iterrows():
         meld    = _clean(csv_row.get("Meld", "")).upper()
         agent   = _clean(csv_row.get("Agent", ""))
-        agent_l = agent.lower()
+        agent_n = _norm_name(agent)
 
         # ── Parse Check-In date/time from CSV ─────────────────────────────
         checkin_raw = _clean(csv_row.get("Check In", ""))
@@ -521,16 +533,24 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             except Exception:
                 date_display = checkin_raw
 
-        # ── Find matching TSheets shift ────────────────────────────────────
-        tshift = ts_exact.get((agent_l, meld, date_iso))
-        if not tshift:
-            candidates = ts_by_meld.get((agent_l, meld), [])
-            # Pick candidate whose date matches; if none, take first
-            tshift = next((c for c in candidates if c["date_iso"] == date_iso), None)
-            if not tshift and candidates:
-                tshift = candidates[0]
+        # ── Tier 1: exact normalized name + meld + date ───────────────────
+        tshift = ts_name_meld_date.get((agent_n, meld, date_iso))
 
-        # ── Hours: TSheets if matched, else CSV Hours column ───────────────
+        # ── Tier 2: normalized name + meld (any date) ─────────────────────
+        if not tshift:
+            cands = ts_name_meld.get((agent_n, meld), [])
+            tshift = next((c for c in cands if c["date_iso"] == date_iso), None)
+            if not tshift and cands:
+                tshift = cands[0]
+
+        # ── Tier 3: Meld ID only (handles name spelling differences) ──────
+        if not tshift and meld:
+            meld_cands = ts_meld_only.get(meld, [])
+            tshift = next((c for c in meld_cands if c["date_iso"] == date_iso), None)
+            if not tshift and meld_cands:
+                tshift = meld_cands[0]
+
+        # ── Hours resolution ──────────────────────────────────────────────
         if tshift:
             actual    = tshift["duration"]
             time_in   = tshift["time_in"] or time_in_display
@@ -539,6 +559,7 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             flat_b    = is_flat_bill(tshift["notes"])
             ts_ok     = True
         else:
+            # Tier 4: CSV Hours column — authoritative fallback per SOP §4.1
             csv_hrs = csv_row.get("Hours") or csv_row.get("Check-In Hours") or 0
             try:
                 actual = float(csv_hrs)
@@ -548,7 +569,7 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             raw_notes = ""
             nb        = False
             flat_b    = False
-            ts_ok     = False
+            ts_ok     = bool(actual)  # not flagged if CSV has hours
 
         paying   = actual
         billable = calc_billable(actual, nb)
@@ -571,8 +592,8 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             flag_parts.append("Not billable- to be flat bill")
         elif nb:
             flag_parts.append(non_billable_note(raw_notes))
-        if not ts_ok:
-            flag_parts.append("⚠ No TSheets match – hours from CSV")
+        if not tshift and not actual:
+            flag_parts.append("⚠ No hours found – verify in TSheets and CSV")
         j_note = " | ".join(filter(None, flag_parts + [desc]))
 
         rows.append({
@@ -597,7 +618,7 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             "_flat_bill":        flat_b,
             "_nb_missing_note":  nb and not flag_parts,
             "_meld_found":       True,          # all rows come from CSV
-            "_tsheets_matched":  ts_ok,
+            "_tsheets_matched":  tshift is not None,
             "_no_mwo":           not meld,
             "_no_trade":         not trade,
             "_no_raw_notes":     not raw_notes.strip(),
