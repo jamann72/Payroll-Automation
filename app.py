@@ -354,8 +354,8 @@ def _check_threshold(actual: float, entry: dict) -> tuple[str, str] | None:
 
 
 def calc_billable(actual: float, non_billable: bool) -> float:
-    """§5.6: NB → 0 | min 1 hr | round UP to nearest 0.25 hr"""
-    if non_billable:
+    """§5.6: NB or zero/negative hours → 0 | else min 1 hr | round UP to nearest 0.25 hr"""
+    if non_billable or actual <= 0:
         return 0.0
     rounded = math.ceil(actual * 4) / 4
     return max(1.0, rounded)
@@ -863,19 +863,28 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
         if tshift:
             ts_matched_ids.add(id(tshift))
 
-        # ── Hours resolution ──────────────────────────────────────────────
+        # ── Hours resolution (§4.1) ───────────────────────────────────────
+        # Property Meld CSV Hours is the PRIMARY per-work-order time and is
+        # authoritative.  The matched TSheets shift is used ONLY to verify the
+        # tech clocked in and to source the technician's notes — NOT for hours.
+        # (Using TSheets duration here double-counted shifts that span multiple
+        #  CSV rows and inflated zero-hour admin rows.)
+        csv_hrs = (csv_row.get("Hours")
+                   if csv_row.get("Hours") not in (None, "")
+                   else (csv_row.get("Check-In Hours")
+                         or csv_row.get("Total Labor Hours") or 0))
+        try:
+            actual = float(csv_hrs)
+        except (ValueError, TypeError):
+            actual = 0.0
+
+        ts_duration = tshift["duration"] if tshift else None
         if tshift:
-            actual    = tshift["duration"]
             time_in   = tshift["time_in"] or time_in_display
             raw_notes = tshift["notes"]
             nb        = tshift["non_billable"]
             flat_b    = is_flat_bill(tshift["notes"])
         else:
-            csv_hrs = csv_row.get("Check-In Hours") or csv_row.get("Hours") or 0
-            try:
-                actual = float(csv_hrs)
-            except (ValueError, TypeError):
-                actual = 0.0
             time_in   = time_in_display
             raw_notes = ""
             nb        = False
@@ -976,6 +985,8 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             "_possible_dup":  False,
             "_overlap_flag":  False,
             "_turnover":      is_turn,
+            "_non_labor":     actual <= 0,   # admin/contact/scoping (no field time)
+            "_ts_duration":   ts_duration,   # matched TSheets shift hrs (verify only)
             "_approval":      "Approved",   # set in post-process below
         })
 
@@ -1024,6 +1035,8 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
             "_possible_dup":  False,
             "_overlap_flag":  False,
             "_turnover":      is_turnover("", sh["notes"]),
+            "_non_labor":     False,
+            "_ts_duration":   sh["duration"],
             "_approval":      "Approved",   # set in post-process below
         })
 
@@ -1070,6 +1083,9 @@ def build_recap_rows(employees: list[dict], melds_df: pd.DataFrame) -> list[dict
 
 def _row_needs_review(r: dict) -> bool:
     """Return True if any flag should override default 'Approved' status."""
+    # Non-labor admin/contact rows (0 hrs) carry no billable risk → stay Approved.
+    if r.get("_non_labor"):
+        return False
     return bool(
         r.get("_thresh_result") is not None          # UNDER or OVER
         or not r.get("_tsheets_matched", True)        # No TSheets match
@@ -1086,18 +1102,15 @@ def _row_needs_review(r: dict) -> bool:
     )
 
 
-def build_payroll_rows(employees: list[dict], recap_rows: list[dict]) -> list[dict]:
+def build_payroll_rows(employees: list[dict], recap_rows: list[dict] | None = None) -> list[dict]:
     """
     §5.11 SOP v2.0 — Payroll Hours Spreadsheet
-    Paying hours = per-employee sum of Column G from recap_rows.
-    Vacation = TSheets PTO (combined; Holiday + Sick/Flex filled manually).
-    PTO does NOT count toward 40-hr OT threshold.
+    PAYROLL pays the employee for hours CLOCKED in TSheets (QB Time payroll
+    summary) — NOT the client-billable hours from the recap.  Regular/OT come
+    straight from the QB Time summary (which already splits at 40h); Vacation =
+    TSheets PTO.  Holiday + Sick/Flex are filled in manually.
+    (recap_rows kept for signature compatibility; no longer used for hours.)
     """
-    paying_by_emp: dict[str, float] = defaultdict(float)
-    for r in recap_rows:
-        if not r.get("_no_meld_entry", False):
-            paying_by_emp[r["Tech"]] += r["Paying"]
-
     rows = []
     for emp in employees:
         full  = emp["name"].strip()
@@ -1105,13 +1118,17 @@ def build_payroll_rows(employees: list[dict], recap_rows: list[dict]) -> list[di
         last  = parts[-1] if parts else full
         first = " ".join(parts[:-1]) if len(parts) > 1 else ""
 
-        paying_total = paying_by_emp.get(full, emp["total_hours"] - emp["pto"])
-        regular      = min(paying_total, OT_THRESHOLD)
-        ot           = max(0.0, paying_total - OT_THRESHOLD)
-        vacation     = emp["pto"]
-        holiday      = 0.0
-        sick_flex    = 0.0
-        total        = regular + vacation + holiday + sick_flex + ot
+        regular   = emp.get("regular", 0.0)
+        ot        = emp.get("ot", 0.0)
+        # QB Time sometimes reports all worked hours under Regular without
+        # splitting OT — apply the 40h split defensively if OT wasn't provided.
+        if ot == 0.0 and regular > OT_THRESHOLD:
+            ot      = regular - OT_THRESHOLD
+            regular = OT_THRESHOLD
+        vacation  = emp.get("pto", 0.0)
+        holiday   = 0.0
+        sick_flex = 0.0
+        total     = regular + vacation + holiday + sick_flex + ot
 
         rows.append({
             "Last Name":  last,
@@ -1206,12 +1223,25 @@ def _sheet_weekly_recap(wb: Workbook, rows: list[dict], employees: list[dict]):
     ws.row_dimensions[3].height = 28
     ws.freeze_panes = "A4"
 
-    # Separate standard rows from 15 Circle St rows
-    standard_rows   = [r for r in rows if not r.get("_is_15_circle")]
-    circle_rows     = [r for r in rows if r.get("_is_15_circle")]
+    # Categorize into four mutually-exclusive sections so each total is clean:
+    #   1. Standard billing  – matched Property Meld work, not 15 Circle St
+    #   2. 15 Circle St       – billed independently (§5.9/§6)
+    #   3. No-Meld            – unmatched TSheets time, no work order (§7.3)
+    #   4. Non-Labor / Admin  – 0-hour CSV entries (contact/scoping/status)
+    nonlabor_rows   = [r for r in rows if r.get("_non_labor")]
+    nomeld_rows     = [r for r in rows if r.get("_no_meld_entry")
+                       and not r.get("_non_labor")]
+    labor_rows      = [r for r in rows if not r.get("_non_labor")
+                       and not r.get("_no_meld_entry")]
+    standard_rows   = [r for r in labor_rows if not r.get("_is_15_circle")]
+    circle_rows     = [r for r in labor_rows if r.get("_is_15_circle")]
     sorted_standard = sorted(standard_rows,
                              key=lambda r: (r["Tech"], r["_date_iso"], r["Check-In"]))
     sorted_circle   = sorted(circle_rows,
+                             key=lambda r: (r["Tech"], r["_date_iso"], r["Check-In"]))
+    sorted_nomeld   = sorted(nomeld_rows,
+                             key=lambda r: (r["Tech"], r["_date_iso"], r["Check-In"]))
+    sorted_nonlabor = sorted(nonlabor_rows,
                              key=lambda r: (r["Tech"], r["_date_iso"], r["Check-In"]))
 
     flags: list[dict] = []
@@ -1352,8 +1382,10 @@ def _sheet_weekly_recap(wb: Workbook, rows: list[dict], employees: list[dict]):
         ws.cell(row=gt_row, column=ci).fill = DARK_BLUE
         ws.cell(row=gt_row, column=ci).border = BOX
     for ci, ltr in [(6,"F"), (7,"G"), (8,"H")]:
+        # Subtotal label lives in column A — filter on A (not B) so subtotal
+        # rows are excluded and not double-counted into the grand total.
         cell = ws.cell(row=gt_row, column=ci,
-                       value=f"=SUMIF(B4:B{gt_row-1},\"<>\"&\"Subtotal*\","
+                       value=f"=SUMIF(A4:A{gt_row-1},\"<>Subtotal*\","
                              f"{ltr}4:{ltr}{gt_row-1})")
         cell.fill = DARK_BLUE; cell.font = WHITE_FONT
         cell.number_format = "0.00"
@@ -1396,7 +1428,7 @@ def _sheet_weekly_recap(wb: Workbook, rows: list[dict], employees: list[dict]):
             ws.cell(row=ct_row, column=ci).border = BOX
         for ci, ltr in [(6,"F"), (7,"G"), (8,"H")]:
             cell = ws.cell(row=ct_row, column=ci,
-                           value=f"=SUMIF(B{cs_data_start}:B{cs_data_end},"
+                           value=f"=SUMIF(A{cs_data_start}:A{cs_data_end},"
                                  f"\"<>Subtotal*\","
                                  f"{ltr}{cs_data_start}:{ltr}{cs_data_end})")
             cell.fill = DARK_BLUE; cell.font = WHITE_FONT
@@ -1408,6 +1440,68 @@ def _sheet_weekly_recap(wb: Workbook, rows: list[dict], employees: list[dict]):
             ws.cell(row=ct_row, column=ci).border = BOX
         ws.row_dimensions[ct_row].height = 18
         data_row = ct_row + 2
+
+    # ── No-Meld section (unmatched TSheets time — §7.3) ───────────────────
+    if sorted_nomeld:
+        ws.merge_cells(f"A{data_row}:L{data_row}")
+        hdr = ws.cell(row=data_row, column=1,
+                      value="🔴 NO-MELD — TSheets time with NO Property Meld work order "
+                            "(escalate to manager; NOT part of standard billing) (§7.3)")
+        hdr.font = Font(bold=True, size=11, color="FFFFFF")
+        hdr.fill = PatternFill("solid", fgColor="B71C1C")
+        hdr.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[data_row].height = 18
+        data_row += 1
+
+        nm_data_start = data_row
+        nm_groups: dict[str, list[dict]] = defaultdict(list)
+        for r in sorted_nomeld:
+            nm_groups[r["Tech"]].append(r)
+        for emp_name, emp_rows in nm_groups.items():
+            data_row = _write_employee_group(emp_name, emp_rows, data_row)
+
+        nm_data_end = data_row - 1
+        nt_row = data_row
+        ws.merge_cells(f"A{nt_row}:E{nt_row}")
+        _c(ws, nt_row, 1, "NO-MELD TOTAL (Unmatched — escalate, not billed)",
+           fill=DARK_BLUE, font=WHITE_FONT)
+        ws.cell(row=nt_row, column=1).fill = DARK_BLUE
+        for ci in range(2, 6):
+            ws.cell(row=nt_row, column=ci).fill = DARK_BLUE
+            ws.cell(row=nt_row, column=ci).border = BOX
+        for ci, ltr in [(6,"F"), (7,"G"), (8,"H")]:
+            cell = ws.cell(row=nt_row, column=ci,
+                           value=f"=SUMIF(A{nm_data_start}:A{nm_data_end},"
+                                 f"\"<>Subtotal*\","
+                                 f"{ltr}{nm_data_start}:{ltr}{nm_data_end})")
+            cell.fill = DARK_BLUE; cell.font = WHITE_FONT
+            cell.number_format = "0.00"
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = BOX
+        for ci in [9, 10, 11, 12]:
+            ws.cell(row=nt_row, column=ci).fill = DARK_BLUE
+            ws.cell(row=nt_row, column=ci).border = BOX
+        ws.row_dimensions[nt_row].height = 18
+        data_row = nt_row + 2
+
+    # ── Non-Labor / Admin section (0-hour CSV entries) ────────────────────
+    if sorted_nonlabor:
+        ws.merge_cells(f"A{data_row}:L{data_row}")
+        hdr = ws.cell(row=data_row, column=1,
+                      value="NON-LABOR / ADMIN ENTRIES — resident contact, scoping, "
+                            "status updates (0 field hours; not billed)")
+        hdr.font = Font(bold=True, size=11, color="FFFFFF")
+        hdr.fill = PatternFill("solid", fgColor="616161")
+        hdr.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[data_row].height = 18
+        data_row += 1
+
+        nl_groups: dict[str, list[dict]] = defaultdict(list)
+        for r in sorted_nonlabor:
+            nl_groups[r["Tech"]].append(r)
+        for emp_name, emp_rows in nl_groups.items():
+            data_row = _write_employee_group(emp_name, emp_rows, data_row)
+        data_row += 1
 
     # Legend
     leg_row = data_row
@@ -1559,9 +1653,11 @@ def _sheet_flag_summary(wb: Workbook, recap_rows: list[dict]):
     ws.row_dimensions[3].height = 30
     ws.freeze_panes = "B4"
 
-    # Aggregate per tech
+    # Aggregate per tech (exclude non-labor admin/contact rows)
     techs: dict[str, list[dict]] = defaultdict(list)
     for r in recap_rows:
+        if r.get("_non_labor"):
+            continue
         techs[r["Tech"] or "(unknown)"].append(r)
 
     sorted_techs = sorted(techs.keys(), key=lambda n: n.lower())
@@ -1709,11 +1805,16 @@ and approval-status totals for quick week-over-week pattern review.
 
     # Metrics
     st.divider()
-    c = st.columns(9)
-    total_actual   = sum(r["Actual"]   for r in recap_rows)
-    total_billable = sum(r["Billable"] for r in recap_rows)
-    no_ts          = sum(1 for r in recap_rows if not r.get("_tsheets_matched", True))
-    no_meld_ct     = sum(1 for r in recap_rows if r.get("_no_meld_entry"))
+    # Property Meld labor = CSV rows with hours, excluding No-Meld and non-labor.
+    pm_rows        = [r for r in recap_rows
+                      if not r.get("_no_meld_entry") and not r.get("_non_labor")]
+    nomeld_rows    = [r for r in recap_rows if r.get("_no_meld_entry")]
+    nonlabor_rows  = [r for r in recap_rows if r.get("_non_labor")]
+    pm_actual      = sum(r["Actual"]   for r in pm_rows)
+    pm_billable    = sum(r["Billable"] for r in pm_rows)
+    nomeld_hrs     = sum(r["Actual"]   for r in nomeld_rows)
+
+    no_meld_ct     = len(nomeld_rows)
     fifteen_ct     = sum(1 for r in recap_rows if r.get("_is_15_circle"))
     over_ct        = sum(1 for r in recap_rows
                          if r.get("_thresh_result") and r["_thresh_result"][0] == "OVER")
@@ -1725,15 +1826,23 @@ and approval-status totals for quick week-over-week pattern review.
     turnover_ct    = sum(1 for r in recap_rows if r.get("_turnover"))
     total_ot       = sum(r["Overtime"] for r in payroll_rows)
 
-    c[0].metric("Employees",          len(employees))
-    c[1].metric("Time Entries",       len(recap_rows))
-    c[2].metric("✓ Approved",         approved_ct)
-    c[3].metric("⚠ Review Required",  review_ct)
-    c[4].metric("Actual Hrs",         f"{total_actual:.2f}")
-    c[5].metric("Billable Hrs",       f"{total_billable:.2f}")
-    c[6].metric("⬆ Over Threshold",  over_ct)
-    c[7].metric("⬇ Under Threshold", under_ct)
-    c[8].metric("OT Hrs",             f"{total_ot:.2f}")
+    c = st.columns(9)
+    c[0].metric("Employees",            len(employees))
+    c[1].metric("Labor Entries",        len(pm_rows))
+    c[2].metric("Meld Actual Hrs",      f"{pm_actual:.2f}")
+    c[3].metric("Meld Billable Hrs",    f"{pm_billable:.2f}")
+    c[4].metric("⚠ Review Required",    review_ct)
+    c[5].metric("🔴 No-Meld Hrs",       f"{nomeld_hrs:.2f}")
+    c[6].metric("⬆ Over Threshold",    over_ct)
+    c[7].metric("⬇ Under Threshold",   under_ct)
+    c[8].metric("OT Hrs",               f"{total_ot:.2f}")
+
+    st.caption(
+        f"**Meld Actual Hrs** = sum of Property Meld CSV Hours (the billing basis).  "
+        f"**No-Meld Hrs** = {nomeld_hrs:.2f}h of TSheets time with no matching work order "
+        f"(escalate, §7.3).  {len(nonlabor_rows)} zero-hour admin/contact entries are "
+        f"shown in a separate section (not billed)."
+    )
 
     if turnover_ct:
         st.info(f"🔁 {turnover_ct} **Turnover** rows detected — threshold checks "
@@ -1770,7 +1879,8 @@ and approval-status totals for quick week-over-week pattern review.
     with t1:
         dc = ["Tech","_date","MWO","Address","Unit","Check-In",
               "Actual","Paying","Billable","_approval","Notes","Trade"]
-        df_d = (pd.DataFrame(recap_rows)[dc]
+        labor_display = [r for r in recap_rows if not r.get("_non_labor")]
+        df_d = (pd.DataFrame(labor_display)[dc]
                 .rename(columns={"_date": "Date", "_approval": "Status"}))
         st.dataframe(df_d, use_container_width=True, hide_index=True,
                      column_config={
@@ -1781,8 +1891,16 @@ and approval-status totals for quick week-over-week pattern review.
         if fifteen_ct:
             st.info(f"🟣 {fifteen_ct} entries at 15 Circle St are included above "
                     f"but appear in a SEPARATE section in the Excel output.")
-        st.caption("Col G (Paying) = Actual by default. Adjust in Excel for unreasonable "
-                   "durations — manager approval + Notes entry required (§5.5).")
+        if nonlabor_rows:
+            with st.expander(f"📋 {len(nonlabor_rows)} Non-Labor / Admin Entries "
+                             f"(resident contact, scoping, status — 0 hrs, not billed)"):
+                df_nl = (pd.DataFrame(nonlabor_rows)[["Tech","_date","MWO","Address",
+                                                      "Notes","Trade"]]
+                         .rename(columns={"_date": "Date"}))
+                st.dataframe(df_nl, use_container_width=True, hide_index=True)
+        st.caption("Col G (Paying) = Actual (Property Meld CSV Hours) by default. "
+                   "Adjust in Excel for unreasonable durations — manager approval + "
+                   "Notes entry required (§5.5).")
 
     with t2:
         df_p = pd.DataFrame(payroll_rows).drop(columns=["_ot_flag","_pto_flag"])
@@ -1804,6 +1922,8 @@ and approval-status totals for quick week-over-week pattern review.
 
         techs: dict[str, list[dict]] = defaultdict(list)
         for r in recap_rows:
+            if r.get("_non_labor"):
+                continue
             techs[r["Tech"] or "(unknown)"].append(r)
 
         rollup_rows = []
